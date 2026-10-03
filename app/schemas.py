@@ -307,6 +307,102 @@ class MessageTrackResponse(BaseModel):
     B_to_A: list[MessageTrackRecord]
 
 
+class TransitionFeasibilityRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+
+    # Read-only executability query for one session at one named version; the
+    # session id travels in the path, exactly like message tracking.
+    expected_version: Annotated[int, Field(ge=0)]
+
+
+class StateMismatchReason(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    # The executing endpoint is not in the transition's source state. Every
+    # unmet condition is reported, so this can accompany a queue reason.
+    error: Literal["state_mismatch"]
+    endpoint: Literal["A", "B"]
+    direction: Literal["A_to_B", "B_to_A"]
+    actual: int | str
+    required: int | str
+
+
+class SendQueueOccupiedReason(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    # A send needs its own direction's one-slot queue empty; actual is the
+    # message currently occupying the slot, required is an empty slot (null).
+    error: Literal["send_queue_occupied"]
+    endpoint: Literal["A", "B"]
+    direction: Literal["A_to_B", "B_to_A"]
+    actual: str
+    required: None
+
+
+class ReceiveQueueEmptyReason(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    # A receive needs the opposite-direction queue head to equal its message;
+    # when the queue is empty this single reason is reported and no
+    # message_mismatch is added for the same transition.
+    error: Literal["receive_queue_empty"]
+    endpoint: Literal["A", "B"]
+    direction: Literal["A_to_B", "B_to_A"]
+    actual: None
+    required: str
+
+
+class MessageMismatchReason(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    # The one-slot queue holds a message different from the one received.
+    error: Literal["message_mismatch"]
+    endpoint: Literal["A", "B"]
+    direction: Literal["A_to_B", "B_to_A"]
+    actual: str
+    required: str
+
+
+class SessionCompletedReason(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    # A completion configuration (both endpoints final, both queues empty)
+    # disables every transition and reports only this reason.
+    error: Literal["session_completed"]
+
+
+FeasibilityReason = Annotated[
+    Union[
+        StateMismatchReason,
+        SendQueueOccupiedReason,
+        ReceiveQueueEmptyReason,
+        MessageMismatchReason,
+        SessionCompletedReason,
+    ],
+    Field(discriminator="error"),
+]
+
+
+class TransitionFeasibility(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    id: str
+    enabled: bool
+    # All currently unmet conditions for this transition; [] exactly when it
+    # is enabled (unless the session is completed, which reports one reason).
+    reasons: list[FeasibilityReason]
+
+
+class TransitionFeasibilityResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    session_id: str
+    version: int
+    # Every protocol transition, ordered by ascending transition id; [] for a
+    # protocol without transitions.
+    transitions: list[TransitionFeasibility]
+
+
 class SessionView(BaseModel):
     id: str
     version: int

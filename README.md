@@ -595,6 +595,7 @@ curl -X POST http://localhost:8000/v1/deactivation-plans \
 | `POST` | `/v1/sessions/{id}/adoptions` | 把来源会话的后续轨迹接回本目标会话，请求体 `{"source_session_id": ..., "target_expected_version": ..., "source_expected_version": ...}` |
 | `POST` | `/v1/session-comparisons` | 按消息方向对比两次演练（只读、不改数据与版本），请求体 `{"left_session_id": ..., "right_session_id": ..., "left_expected_version": ..., "right_expected_version": ...}` |
 | `POST` | `/v1/sessions/{id}/message-tracks` | 沿轨迹逐条追踪消息发送/接收（只读），请求体 `{"expected_version": ...}` |
+| `POST` | `/v1/sessions/{id}/transition-feasibility` | 查询当前配置下全部转移的可执行性与**所有**阻塞原因（只读），请求体 `{"expected_version": ...}` |
 
 响应均为同一会话视图：
 
@@ -1332,6 +1333,172 @@ curl -s -o /dev/null -w '%{http_code}\n' -X POST \
 
 并发场景下（2 个 worker），追踪与执行/替换协议同时进行时，每个追踪要么返回指定版本的完整结果，要么返回 `409`，绝不会出现跨版本拼凑的配对。
 
+### 转移可执行性与阻塞原因：`POST /v1/sessions/{id}/transition-feasibility`
+
+查询演练会话**当前配置**下每个转移是否可执行，并为不可执行转移列出**全部**不满足项（不只报第一项）：
+
+- 请求体只含 `{"expected_version": ...}`；服务把该版本轨迹 ID 按**该版本当前协议**（协议被替换过则按替换后的新定义）从初态重放到当前配置，再逐条检查协议中的全部转移。
+- 转移按 **ID 升序**返回，每条含 `id`、`enabled` 与 `reasons`；**可执行时 `reasons` 为 `[]`**；协议没有转移时返回空列表。
+- 逐条独立检查，每个不满足条件都列出，附端点、队列方向、实际值与要求值：
+  - **执行端状态不匹配** `state_mismatch`：`send` 由 `from` 端执行，`receive` 由 `to` 端执行；给出 `endpoint`、`direction`、实际状态 `actual` 与要求的 `source`（`required`）。
+  - **发送队列占用** `send_queue_occupied`：发送方向那一格队列非空，`actual` 为格中现有消息，`required` 为 `null`（要求空）。
+  - **接收队列空** `receive_queue_empty`：接收要求的反方向那一格为空；`actual` 为 `null`，`required` 为该转移的 `message`。队列空时**不再重复报**消息不匹配。
+  - **消息不匹配** `message_mismatch`：对应方向队首消息不等于该转移的消息，`actual` 为队首消息、`required` 为要求消息。
+- `direction` 为队列方向：`"A_to_B"` 或 `"B_to_A"`（接收转移的方向是其消息流向，例如 B 接收 A→B 的消息时 `endpoint` 为 `B`、`direction` 为 `A_to_B`）。
+- **完成配置**下所有转移 `enabled` 均为 `false`，且只报一条 `{"error": "session_completed"}`，不再逐条罗列状态/队列条件。
+- 响应回显 `session_id` 与所用 `version`。接口**只读**：不改数据、不推进版本；**锁定会话也可查询**，锁定不是协议阻塞原因（原因中不会出现锁定）。
+- 会话行在一个读事务内读取，版本、协议文本与轨迹 ID 来自同一份已提交快照：并发修改时要么返回指定版本的完整结果，要么返回 `409` 及 `current_version`，绝不混入随后提交的步骤。未知会话 `404`；请求体不合法（缺少/越界 `expected_version`、未定义字段）返回 `422`。
+
+#### 可执行示例：多原因并存（端口 8000）
+
+下面的协议中，初态执行 `s1`（A 发送 `m`，0→1）后，各转移分别命中不同的阻塞组合：状态不匹配、队列占用、队列空、消息不匹配，且部分转移**同时**命中两项。
+
+```bash
+FEAS='{
+  "A": { "states": [0, 1], "initial": 0, "finals": [1] },
+  "B": { "states": [0, 1], "initial": 0, "finals": [1] },
+  "transitions": [
+    { "id": "s1", "from": "A", "to": "B", "action": "send",    "message": "m", "source": 0, "target": 1 },
+    { "id": "s2", "from": "B", "to": "A", "action": "send",    "message": "n", "source": 0, "target": 1 },
+    { "id": "r1", "from": "A", "to": "B", "action": "receive", "message": "m", "source": 0, "target": 1 },
+    { "id": "r2", "from": "B", "to": "A", "action": "receive", "message": "n", "source": 0, "target": 1 },
+    { "id": "s3", "from": "A", "to": "B", "action": "send",    "message": "z", "source": 1, "target": 1 },
+    { "id": "r3", "from": "A", "to": "B", "action": "receive", "message": "x", "source": 0, "target": 0 }
+  ]
+}'
+SID=$(curl -s -X POST http://localhost:8000/v1/sessions \
+  -H 'Content-Type: application/json' -d "$FEAS" \
+  | python3 -c 'import sys,json;print(json.load(sys.stdin)["id"])')
+
+# 初态（version 0）：s1、s2 可执行；接收队列空，s3 source 不对
+curl -s -X POST http://localhost:8000/v1/sessions/$SID/transition-feasibility \
+  -H 'Content-Type: application/json' -d '{"expected_version": 0}'
+
+# 执行 s1 后：A=1、B=0，A_to_B 格中为 "m"（version 1）
+curl -s -o /dev/null -X POST http://localhost:8000/v1/sessions/$SID/transitions \
+  -H 'Content-Type: application/json' \
+  -d '{"transition_id": "s1", "expected_version": 0}'
+
+curl -s -X POST http://localhost:8000/v1/sessions/$SID/transition-feasibility \
+  -H 'Content-Type: application/json' -d '{"expected_version": 1}'
+```
+
+第二次查询（A=1、B=0，A→B 格中为 `"m"`，B→A 为空）的响应：
+
+```json
+{
+  "session_id": "…",
+  "version": 1,
+  "transitions": [
+    {
+      "id": "s1",
+      "enabled": false,
+      "reasons": [
+        { "error": "state_mismatch", "endpoint": "A", "direction": "A_to_B", "actual": 1, "required": 0 },
+        { "error": "send_queue_occupied", "endpoint": "A", "direction": "A_to_B", "actual": "m", "required": null }
+      ]
+    },
+    { "id": "s2", "enabled": true, "reasons": [] },
+    { "id": "r1", "enabled": true, "reasons": [] },
+    {
+      "id": "r2",
+      "enabled": false,
+      "reasons": [
+        { "error": "state_mismatch", "endpoint": "A", "direction": "B_to_A", "actual": 1, "required": 0 },
+        { "error": "receive_queue_empty", "endpoint": "A", "direction": "B_to_A", "actual": null, "required": "n" }
+      ]
+    },
+    {
+      "id": "s3",
+      "enabled": false,
+      "reasons": [
+        { "error": "send_queue_occupied", "endpoint": "A", "direction": "A_to_B", "actual": "m", "required": null }
+      ]
+    },
+    {
+      "id": "r3",
+      "enabled": false,
+      "reasons": [
+        { "error": "message_mismatch", "endpoint": "B", "direction": "A_to_B", "actual": "m", "required": "x" }
+      ]
+    }
+  ]
+}
+```
+
+注意：
+
+- `s1` 同时不满足「执行端状态」与「发送队列须空」两项，两项都列出（`actual`/`required` 各自给出）；
+- `r2` 的 B→A 队列空，只报 `receive_queue_empty`，**不再**报 `n` 消息不匹配；
+- `r3` 由 B 端接收 A→B 方向的消息：`endpoint` 为 `"B"`、`direction` 为 `"A_to_B"`，队首 `"m"` 与要求 `"x"` 不符；
+- 初态查询中 `s3` 只有 `state_mismatch`（A=0、要求 source 1），此时 A→B 队列为空、不占队列原因；
+- `enabled` 为 `true` 的转移与 `GET /v1/sessions/{id}` 返回的 `enabled_transition_ids` 完全一致。
+
+#### 可执行示例：完成状态只报已完成
+
+```bash
+PROTO='{
+  "A": { "states": [0, 1], "initial": 0, "finals": [1] },
+  "B": { "states": [0, 1], "initial": 0, "finals": [1] },
+  "transitions": [
+    { "id": "t1", "from": "A", "to": "B", "action": "send",    "message": "m", "source": 0, "target": 1 },
+    { "id": "t4", "from": "A", "to": "B", "action": "receive", "message": "m", "source": 0, "target": 1 }
+  ]
+}'
+CID=$(curl -s -X POST http://localhost:8000/v1/sessions \
+  -H 'Content-Type: application/json' -d "$PROTO" \
+  | python3 -c 'import sys,json;print(json.load(sys.stdin)["id"])')
+curl -s -o /dev/null -X POST http://localhost:8000/v1/sessions/$CID/transitions \
+  -H 'Content-Type: application/json' -d '{"transition_id":"t1","expected_version":0}'
+curl -s -o /dev/null -X POST http://localhost:8000/v1/sessions/$CID/transitions \
+  -H 'Content-Type: application/json' -d '{"transition_id":"t4","expected_version":1}'
+
+curl -s -X POST http://localhost:8000/v1/sessions/$CID/transition-feasibility \
+  -H 'Content-Type: application/json' -d '{"expected_version": 2}'
+```
+
+到达完成配置（两端终态、两个队列均空）后，全部转移 `enabled` 为 `false`，且只报一条已完成原因：
+
+```json
+{
+  "session_id": "…",
+  "version": 2,
+  "transitions": [
+    { "id": "t1", "enabled": false, "reasons": [ { "error": "session_completed" } ] },
+    { "id": "t4", "enabled": false, "reasons": [ { "error": "session_completed" } ] }
+  ]
+}
+```
+
+协议本身没有转移时，`transitions` 为 `[]`。
+
+版本过期、未知会话、锁定可读与 422：
+
+```bash
+# expected_version 过期（当前为 2，却传 0）-> 409 并给出 current_version
+curl -s -i -X POST http://localhost:8000/v1/sessions/$CID/transition-feasibility \
+  -H 'Content-Type: application/json' -d '{"expected_version": 0}'
+# HTTP/1.1 409 Conflict
+# {"detail":{"error":"version_conflict","current_version":2}}
+
+# 未知会话 -> 404
+curl -s -i -X POST http://localhost:8000/v1/sessions/does-not-exist/transition-feasibility \
+  -H 'Content-Type: application/json' -d '{"expected_version": 0}'
+# HTTP/1.1 404 Not Found  ->  {"detail":"unknown session"}
+
+# 锁定后仍可查询（200），原因里不含锁定
+curl -s -o /dev/null -X PUT http://localhost:8000/v1/sessions/$CID/lock \
+  -H 'Content-Type: application/json' -d '{"expected_version":2,"locked":true}'
+curl -s -o /dev/null -w '%{http_code}\n' -X POST \
+  http://localhost:8000/v1/sessions/$CID/transition-feasibility \
+  -H 'Content-Type: application/json' -d '{"expected_version": 3}'
+# 200
+
+# 缺少 expected_version / 负数 / 额外字段 -> 422
+```
+
+替换协议后查询按**新定义**重放（例如把 `s1` 的消息由 `"m"` 改为 `"ZZ"`，再按新版本查询即得到 `actual: "ZZ"` 的消息不匹配与队列占用）；查询不写数据、不消耗版本。并发场景下（2 个 worker），查询与执行/替换协议同时进行时，每个查询要么返回指定版本的完整结果，要么返回 `409`，不会出现跨版本拼凑的原因列表。
+
 ### 存储位置与卷保留规则
 
 - 数据库文件：容器内 **`/data/sessions.db`**（WAL 模式，运行时可能伴随 `-wal` / `-shm` 文件），可用环境变量 `SESSIONS_DB` 覆盖；本地开发缺省为工作目录下的 `./sessions.db`。
@@ -1419,5 +1586,6 @@ uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
 ├── test_comparison.py
 ├── test_lock.py
 ├── test_message_tracks.py
-└── test_sessions.py
+├── test_sessions.py
+└── test_transition_feasibility.py
 ```
