@@ -574,7 +574,7 @@ curl -X POST http://localhost:8000/v1/deactivation-plans \
 
 ## 双端协议演练会话
 
-除上述四个离线分析接口外，服务还提供**有状态演练会话**：创建会话后可以逐个执行转移、随时查询当前配置与完整执行轨迹，也可以修改协议后从新初态重放已执行步骤，继续演练；还可以从指定轨迹位置另开**分支会话**，两边独立续演；另一会话中已走通的后续轨迹也可以直接**接回**目标会话，免去逐步重演。两次演练还可以按方向**对比消息交换**：只比较各自 `(action, message)` 序列，忽略转移 ID、端点状态与两方向之间的交错。还可以沿一次演练的完整轨迹**逐条追踪每个消息的发送与接收**：每次发送单列一条记录并与同方向后续的接收按一格队列先后配对，尚未被接收的发送三项接收信息为 `null`。会话还可以被**锁定为只读基准**：锁定后执行、替换协议与作为接回目标均被拒绝，查询、对比、分支与作为接回来源不受影响，解锁后按新版本继续演练。
+除上述四个离线分析接口外，服务还提供**有状态演练会话**：创建会话后可以逐个执行转移、随时查询当前配置与完整执行轨迹，也可以修改协议后从新初态重放已执行步骤，继续演练；还可以从指定轨迹位置另开**分支会话**，两边独立续演；另一会话中已走通的后续轨迹也可以直接**接回**目标会话，免去逐步重演。两次演练还可以按方向**对比消息交换**：只比较各自 `(action, message)` 序列，忽略转移 ID、端点状态与两方向之间的交错。还可以沿一次演练的完整轨迹**逐条追踪每个消息的发送与接收**：每次发送单列一条记录并与同方向后续的接收按一格队列先后配对，尚未被接收的发送三项接收信息为 `null`。也可以**查询当前各转移的可执行性与全部阻塞原因**：完整重放轨迹后，对每条转移独立列出执行端状态与一格队列的所有不满足项（状态不匹配、发送队列占用、接收队列空、消息不匹配），完成配置下统一只报已完成。会话还可以被**锁定为只读基准**：锁定后执行、替换协议与作为接回目标均被拒绝，查询、对比、分支与作为接回来源不受影响，解锁后按新版本继续演练。
 
 - 会话（协议、轨迹 ID、版本、锁定标记）持久化在**本地 SQLite 数据库**中，所有进程共享同一文件：服务或容器重建后仍可按原会话 ID 查询并继续执行、替换协议，版本不会回退。
 - 服务默认以 **2 个 Uvicorn worker** 进程运行，启动时自动建库建表（无需迁移旧数据）；旧版数据库启动时自动补充锁定列，已有协议、轨迹与版本保持不变，旧会话默认未锁定。
@@ -595,6 +595,7 @@ curl -X POST http://localhost:8000/v1/deactivation-plans \
 | `POST` | `/v1/sessions/{id}/adoptions` | 把来源会话的后续轨迹接回本目标会话，请求体 `{"source_session_id": ..., "target_expected_version": ..., "source_expected_version": ...}` |
 | `POST` | `/v1/session-comparisons` | 按消息方向对比两次演练（只读、不改数据与版本），请求体 `{"left_session_id": ..., "right_session_id": ..., "left_expected_version": ..., "right_expected_version": ...}` |
 | `POST` | `/v1/sessions/{id}/message-tracks` | 沿轨迹逐条追踪消息发送/接收（只读），请求体 `{"expected_version": ...}` |
+| `POST` | `/v1/sessions/{id}/transition-checks` | 查询当前各转移的可执行性与全部阻塞原因（只读），请求体 `{"expected_version": ...}` |
 
 响应均为同一会话视图：
 
@@ -1332,6 +1333,172 @@ curl -s -o /dev/null -w '%{http_code}\n' -X POST \
 
 并发场景下（2 个 worker），追踪与执行/替换协议同时进行时，每个追踪要么返回指定版本的完整结果，要么返回 `409`，绝不会出现跨版本拼凑的配对。
 
+### 各转移可执行性与阻塞原因：`POST /v1/sessions/{id}/transition-checks`
+
+查询一次演练**当前各转移的可执行性及阻塞原因**，用于在不尝试执行的情况下看清「这一步为什么走不了、还差什么」：
+
+- 请求体只含 `{"expected_version": ...}`；路径 `{id}` 为要查询的会话。
+- 服务把该版本的轨迹 ID 按**该版本当前协议**（协议被替换过则按替换后的新定义）从初态**完整重放**，得到当前配置，再对协议中的**每条转移**独立判定，按转移 ID **升序**返回全部转移的 `id`、`enabled` 与 `reasons` 列表。可执行时 `reasons` 为 `[]`。
+- 未完成时，每条转移分别检查**执行端状态**与**对应方向的一格队列**，并列出**全部**不满足项（不只报首项）：
+  - **状态不匹配**（`state_mismatch`）：执行端当前状态 ≠ 转移 `source`；`send` 检查 `from` 端，`receive` 检查 `to` 端。原因含 `endpoint`（`"A"`/`"B"`）、`actual`（实际状态）与 `required`（要求状态）。
+  - **发送队列占用**（`send_queue_occupied`）：`send` 转移自己方向（`from -> to`）的一格队列非空。原因含 `direction`（`"A_to_B"`/`"B_to_A"`）、`actual`（格中现有消息）与 `required`（要求为空格，值为 `null`）。
+  - **接收队列空**（`receive_queue_empty`）：`receive` 转移所消费的反方向队列为空。原因含 `direction`、`actual`（`null`）与 `required`（要求的消息）。**队列空时只报这一项，不再重复报消息不匹配**。
+  - **消息不匹配**（`message_mismatch`）：反方向队列非空但队首消息 ≠ 转移 `message`。原因含 `direction`、`actual`（队首实际消息）与 `required`（要求的消息）。
+- **完成配置**（两端终态、两队列皆空）下不再做单项检查：所有转移 `enabled=false`，且每条**只报** `{"error": "session_completed"}`。
+- 协议没有任何转移时，`transitions` 返回 `[]`。
+- 响应回显 `session_id` 与所用 `version`。接口**只读**：不改任何数据、不推进版本；**锁定会话也可查询**，锁定不算协议阻塞原因（原因里不会出现 `session_locked`）。
+- 会话行在一个读事务内读取，版本、协议文本与轨迹 ID 来自同一份已提交快照：与执行、替换协议等修改并发时，要么返回指定版本的完整结果，要么返回 `409` 及 `current_version`，绝不混入随后提交的步骤。未知会话返回 `404`；请求体不合法（缺少/越界 `expected_version`、出现未定义字段）返回 `422`。
+
+`reasons` 内每个原因对象形如 `{"error": ..., "endpoint"/"direction": ..., "actual": ..., "required": ...}`；某类原因用不到的端点/方向字段不出现。状态原因的 `actual`/`required` 是端点状态（整数或字符串），队列原因的 `actual`/`required` 是一格队列内容（消息字符串或 `null`）。
+
+#### 可执行示例：多原因并列（端口 8000）
+
+下面的协议在初态可执行 `s1`（A 发 `m`）与 `x`（B 发 `q`）；`r2`（B 收 `m`）因 A→B 队列空而不能收；`r1`（B 在状态 1 收 `m`）同时存在**状态不匹配**与**接收队列空**两个原因；`s2`（A 在状态 1 再发 `n`）只有状态不匹配。
+
+```bash
+CHK='{
+  "A": { "states": [0, 1, 2], "initial": 0, "finals": [2] },
+  "B": { "states": [0, 1, 2], "initial": 0, "finals": [2] },
+  "transitions": [
+    { "id": "s1", "from": "A", "to": "B", "action": "send",    "message": "m", "source": 0, "target": 1 },
+    { "id": "s2", "from": "A", "to": "B", "action": "send",    "message": "n", "source": 1, "target": 1 },
+    { "id": "r1", "from": "A", "to": "B", "action": "receive", "message": "m", "source": 1, "target": 1 },
+    { "id": "r2", "from": "A", "to": "B", "action": "receive", "message": "m", "source": 0, "target": 1 },
+    { "id": "x",  "from": "B", "to": "A", "action": "send",    "message": "q", "source": 0, "target": 1 }
+  ]
+}'
+TID=$(curl -s -X POST http://localhost:8000/v1/sessions \
+  -H 'Content-Type: application/json' -d "$CHK" \
+  | python3 -c 'import sys,json;print(json.load(sys.stdin)["id"])')
+
+curl -s -X POST http://localhost:8000/v1/sessions/$TID/transition-checks \
+  -H 'Content-Type: application/json' -d '{"expected_version": 0}'
+```
+
+初态返回（按 ID 升序；可执行项 `reasons` 为 `[]`，`r1` 一次列出两个原因，队列空时不重复报消息不匹配）：
+
+```json
+{
+  "session_id": "…",
+  "version": 0,
+  "transitions": [
+    {
+      "transition_id": "r1",
+      "enabled": false,
+      "reasons": [
+        { "error": "state_mismatch", "endpoint": "B", "actual": 0, "required": 1 },
+        { "error": "receive_queue_empty", "direction": "A_to_B", "actual": null, "required": "m" }
+      ]
+    },
+    {
+      "transition_id": "r2",
+      "enabled": false,
+      "reasons": [
+        { "error": "receive_queue_empty", "direction": "A_to_B", "actual": null, "required": "m" }
+      ]
+    },
+    { "transition_id": "s1", "enabled": true, "reasons": [] },
+    {
+      "transition_id": "s2",
+      "enabled": false,
+      "reasons": [
+        { "error": "state_mismatch", "endpoint": "A", "actual": 0, "required": 1 }
+      ]
+    },
+    { "transition_id": "x", "enabled": true, "reasons": [] }
+  ]
+}
+```
+
+执行 `s1` 后（`version` 变为 `1`，A=1、A→B 格中为 `"m"`）再查，可同时看到**发送队列占用**、发送端的**状态+占用双原因**，以及队首消息**不匹配**：
+
+```bash
+curl -s -o /dev/null -X POST http://localhost:8000/v1/sessions/$TID/transitions \
+  -H 'Content-Type: application/json' -d '{"transition_id":"s1","expected_version":0}'
+
+# 再构造一条 B 发 q、但用“收 n”去取的消息不匹配场景
+MM='{
+  "A": { "states": [0, 1], "initial": 0, "finals": [1] },
+  "B": { "states": [0, 1], "initial": 0, "finals": [1] },
+  "transitions": [
+    { "id": "sendQ", "from": "B", "to": "A", "action": "send",    "message": "q", "source": 0, "target": 1 },
+    { "id": "recvN", "from": "B", "to": "A", "action": "receive", "message": "n", "source": 0, "target": 1 },
+    { "id": "recvQ", "from": "B", "to": "A", "action": "receive", "message": "q", "source": 0, "target": 1 }
+  ]
+}'
+MID=$(curl -s -X POST http://localhost:8000/v1/sessions -H 'Content-Type: application/json' -d "$MM" \
+  | python3 -c 'import sys,json;print(json.load(sys.stdin)["id"])')
+curl -s -o /dev/null -X POST http://localhost:8000/v1/sessions/$MID/transitions \
+  -H 'Content-Type: application/json' -d '{"transition_id":"sendQ","expected_version":0}'
+curl -s -X POST http://localhost:8000/v1/sessions/$MID/transition-checks \
+  -H 'Content-Type: application/json' -d '{"expected_version": 1}'
+```
+
+- 会话 `$TID`（A→B 格为 `"m"`、A=1）中：`s2` 只报 `send_queue_occupied`（`actual: "m"`、`required: null`）；`s1` 同时报 `state_mismatch`（A 实际 `1`、要求 `0`）与 `send_queue_occupied`；`r2`（B 在状态 0 收 `m`）此时可执行，`reasons` 为 `[]`。
+- 会话 `$MID`（B→A 格为 `"q"`）中：`recvN` 报 `message_mismatch`（`direction: "B_to_A"`、`actual: "q"`、`required: "n"`），而 `recvQ` 可执行。
+
+#### 可执行示例：完成状态只报已完成（端口 8000）
+
+到达完成配置后，所有转移 `enabled=false` 且**只报** `session_completed`，不再罗列状态/队列原因：
+
+```bash
+DONE='{
+  "A": { "states": [0, 1], "initial": 0, "finals": [1] },
+  "B": { "states": [0, 1], "initial": 0, "finals": [1] },
+  "transitions": [
+    { "id": "t1", "from": "A", "to": "B", "action": "send",    "message": "m", "source": 0, "target": 1 },
+    { "id": "t4", "from": "A", "to": "B", "action": "receive", "message": "m", "source": 0, "target": 1 }
+  ]
+}'
+DID=$(curl -s -X POST http://localhost:8000/v1/sessions -H 'Content-Type: application/json' -d "$DONE" \
+  | python3 -c 'import sys,json;print(json.load(sys.stdin)["id"])')
+curl -s -o /dev/null -X POST http://localhost:8000/v1/sessions/$DID/transitions \
+  -H 'Content-Type: application/json' -d '{"transition_id":"t1","expected_version":0}'
+curl -s -o /dev/null -X POST http://localhost:8000/v1/sessions/$DID/transitions \
+  -H 'Content-Type: application/json' -d '{"transition_id":"t4","expected_version":1}'
+
+curl -s -X POST http://localhost:8000/v1/sessions/$DID/transition-checks \
+  -H 'Content-Type: application/json' -d '{"expected_version": 2}'
+```
+
+```json
+{
+  "session_id": "…",
+  "version": 2,
+  "transitions": [
+    { "transition_id": "t1", "enabled": false, "reasons": [ { "error": "session_completed" } ] },
+    { "transition_id": "t4", "enabled": false, "reasons": [ { "error": "session_completed" } ] }
+  ]
+}
+```
+
+协议不含任何转移（两端初态即终态）时，`transitions` 为 `[]`。
+
+#### 版本、锁定与并发
+
+```bash
+# expected_version 过期（当前为 1，却传 0）-> 409 并给出 current_version
+curl -s -i -X POST http://localhost:8000/v1/sessions/$TID/transition-checks \
+  -H 'Content-Type: application/json' -d '{"expected_version": 0}'
+# HTTP/1.1 409 Conflict
+# {"detail":{"error":"version_conflict","current_version":1}}
+
+# 未知会话 -> 404
+curl -s -i -X POST http://localhost:8000/v1/sessions/does-not-exist/transition-checks \
+  -H 'Content-Type: application/json' -d '{"expected_version": 0}'
+# HTTP/1.1 404 Not Found  ->  {"detail":"unknown session"}
+
+# 锁定后仍可查询（200），且原因里没有 session_locked
+curl -s -o /dev/null -X PUT http://localhost:8000/v1/sessions/$TID/lock \
+  -H 'Content-Type: application/json' -d '{"expected_version":1,"locked":true}'
+curl -s -o /dev/null -w '%{http_code}\n' -X POST \
+  http://localhost:8000/v1/sessions/$TID/transition-checks \
+  -H 'Content-Type: application/json' -d '{"expected_version": 2}'
+# 200
+```
+
+查询不写数据、不消耗版本；替换协议后查询按**新定义**判定（例如把某条接收的消息改名，再按新版本查询即得到新的消息不匹配/可执行结论）。并发场景下（2 个 worker），查询与执行/替换协议同时进行时，每个查询要么返回指定版本的完整结果，要么返回 `409`，绝不会出现跨版本拼凑的可执行性结论。
+
 ### 存储位置与卷保留规则
 
 - 数据库文件：容器内 **`/data/sessions.db`**（WAL 模式，运行时可能伴随 `-wal` / `-shm` 文件），可用环境变量 `SESSIONS_DB` 覆盖；本地开发缺省为工作目录下的 `./sessions.db`。
@@ -1419,5 +1586,6 @@ uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
 ├── test_comparison.py
 ├── test_lock.py
 ├── test_message_tracks.py
-└── test_sessions.py
+├── test_sessions.py
+└── test_transition_checks.py
 ```

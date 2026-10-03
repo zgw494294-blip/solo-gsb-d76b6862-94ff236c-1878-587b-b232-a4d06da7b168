@@ -59,6 +59,18 @@ answers either the complete tracking at the named version or a 409 with the
 current version, never a cross-revision mix; an unknown session answers 404
 and a locked session can still be tracked.
 
+The transition-check endpoint goes one step further and inspects every
+protocol transition at the replayed configuration, reporting whether each is
+enabled and listing *all* of its unmet requirements (wrong executing-endpoint
+state, an occupied send slot, an empty receive slot, or a receive head
+message that differs) rather than just the first failure; at a completion
+configuration every transition reports only that the session is completed.
+It shares the read-only, single-snapshot, versioned transaction discipline of
+message tracking: the whole report belongs to one named version, a stale
+version answers 409 with current_version, an unknown session answers 404 and
+a locked session is checkable — the lock is never reported as a
+protocol-level blocker.
+
 A session can be locked into a read-only baseline. Setting the lock flag is
 itself a versioned mutation: it carries an ``expected_version``, changes only
 the flag, advances the version by one and runs inside the same kind of
@@ -666,6 +678,164 @@ def track_messages(session_id: str, expected_version: int) -> dict:
         raise
     finally:
         connection.close()
+
+
+def transition_checks(session_id: str, expected_version: int) -> dict:
+    """Report every transition's executability and all blocking reasons.
+
+    The stored trace is replayed against the session's own current protocol at
+    the named version, reaching the configuration currently under drill. Each
+    protocol transition is then examined independently and every unmet
+    requirement is listed — never just the first:
+
+    * a send is executed by its ``from`` endpoint and needs that endpoint's
+      current state to equal the transition's source, followed by the slot of
+      the send's own direction being empty;
+    * a receive is executed by its ``to`` endpoint and needs that endpoint's
+      state to equal the source, followed by the opposite direction's slot
+      being non-empty and its head message to equal the transition's message;
+      an empty slot reports only "receive queue empty", never a message
+      mismatch on top of it.
+
+    At a completion configuration all transitions report
+    ``session_completed`` instead of the individual checks. The check is
+    read-only like message tracking: the row is read inside one deferred
+    transaction, so the answer is either the whole report at the named
+    version or a 409 carrying current_version, never a cross-revision mix; an
+    unknown session answers 404 and a locked session is reported just as any
+    other snapshot (the lock is not a protocol-level blocker).
+    """
+    connection = _connect()
+    try:
+        connection.execute("BEGIN")
+        row = connection.execute(
+            "SELECT version, protocol, trace_ids FROM sessions WHERE id = ?",
+            (session_id,),
+        ).fetchone()
+        if row is None:
+            raise HTTPException(status_code=404, detail="unknown session")
+
+        version, protocol_text, trace_text = row
+        if version != expected_version:
+            raise _version_conflict(version)
+
+        result = _check_transitions(
+            DeadlockRequest.model_validate(json.loads(protocol_text)),
+            json.loads(trace_text),
+        )
+        return {"session_id": session_id, "version": version, "transitions": result}
+    except BaseException:
+        connection.rollback()
+        raise
+    finally:
+        connection.close()
+
+
+def _check_transitions(protocol, trace_ids: list[str]) -> list[dict]:
+    """Replay the trace and list every transition with all blocking reasons.
+
+    Model transitions are already sorted by id, so the report is ascending by
+    transition id. The state requirement is examined before the queue
+    requirement, but both are reported independently when both fail, so a
+    transition may carry multiple reasons; an enabled transition carries an
+    empty reason list.
+    """
+    model = build_model(protocol)
+    configuration = _replay(model, trace_ids)
+
+    if is_completion(configuration, model.finals):
+        # The completed configuration never expands: every transition is
+        # disabled and the only reason reported is completion.
+        return [
+            {
+                "transition_id": transition.id,
+                "enabled": False,
+                "reasons": [{"error": "session_completed"}],
+            }
+            for transition in model.transitions
+        ]
+
+    items = []
+    for transition in model.transitions:
+        if transition.action == "send":
+            endpoint = transition.sender
+            direction = (
+                "A_to_B" if transition.sender == "A" else "B_to_A"
+            )
+            actual_state = (
+                configuration.state_a if endpoint == "A" else configuration.state_b
+            )
+            queue_content = (
+                configuration.queue_a_to_b
+                if transition.sender == "A"
+                else configuration.queue_b_to_a
+            )
+
+            reasons = []
+            if actual_state != transition.source:
+                reasons.append({
+                    "error": "state_mismatch",
+                    "endpoint": endpoint,
+                    "actual": actual_state,
+                    "required": transition.source,
+                })
+            # The one-slot send queue must be free; an occupied slot reports
+            # the message currently held there and the required empty slot.
+            if queue_content is not None:
+                reasons.append({
+                    "error": "send_queue_occupied",
+                    "direction": direction,
+                    "actual": queue_content,
+                    "required": None,
+                })
+        else:
+            endpoint = transition.receiver
+            # A receive on the "to" endpoint consumes the message flowing in
+            # the opposite direction (to -> from).
+            direction = (
+                "B_to_A" if transition.receiver == "A" else "A_to_B"
+            )
+            actual_state = (
+                configuration.state_a if endpoint == "A" else configuration.state_b
+            )
+            queue_content = (
+                configuration.queue_b_to_a
+                if transition.receiver == "A"
+                else configuration.queue_a_to_b
+            )
+
+            reasons = []
+            if actual_state != transition.source:
+                reasons.append({
+                    "error": "state_mismatch",
+                    "endpoint": endpoint,
+                    "actual": actual_state,
+                    "required": transition.source,
+                })
+            # An empty receive slot and a mismatching head are separate
+            # failures, but an empty slot reports only emptiness — a message
+            # mismatch is never duplicated on top of a missing message.
+            if queue_content is None:
+                reasons.append({
+                    "error": "receive_queue_empty",
+                    "direction": direction,
+                    "actual": None,
+                    "required": transition.message,
+                })
+            elif queue_content != transition.message:
+                reasons.append({
+                    "error": "message_mismatch",
+                    "direction": direction,
+                    "actual": queue_content,
+                    "required": transition.message,
+                })
+
+        items.append({
+            "transition_id": transition.id,
+            "enabled": not reasons,
+            "reasons": reasons,
+        })
+    return items
 
 
 def _track_directions(protocol, trace_ids: list[str]) -> dict[str, list[dict]]:

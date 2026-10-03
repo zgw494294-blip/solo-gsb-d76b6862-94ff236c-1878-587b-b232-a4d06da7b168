@@ -307,6 +307,87 @@ class MessageTrackResponse(BaseModel):
     B_to_A: list[MessageTrackRecord]
 
 
+class _TransitionReasonBase(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+
+class StateMismatchReason(_TransitionReasonBase):
+    # The executing endpoint's current state differs from the transition's
+    # source: a send checks its "from" endpoint, a receive its "to" endpoint.
+    error: Literal["state_mismatch"]
+    endpoint: Literal["A", "B"]
+    actual: int | str
+    required: int | str
+
+
+class SendQueueOccupiedReason(_TransitionReasonBase):
+    # The one-slot queue of the send's own direction already holds a message;
+    # an empty slot is required (null).
+    error: Literal["send_queue_occupied"]
+    direction: Literal["A_to_B", "B_to_A"]
+    actual: str
+    required: None = None
+
+
+class ReceiveQueueEmptyReason(_TransitionReasonBase):
+    # The opposite direction's receive slot is empty (actual null) but the
+    # transition needs its named message; no message mismatch is added.
+    error: Literal["receive_queue_empty"]
+    direction: Literal["A_to_B", "B_to_A"]
+    actual: None = None
+    required: str
+
+
+class MessageMismatchReason(_TransitionReasonBase):
+    # The receive slot is occupied, but its head message differs.
+    error: Literal["message_mismatch"]
+    direction: Literal["A_to_B", "B_to_A"]
+    actual: str
+    required: str
+
+
+class SessionCompletedReason(_TransitionReasonBase):
+    # The session is at a completion configuration, which never expands; this
+    # is the sole reason reported for every transition there.
+    error: Literal["session_completed"]
+
+
+TransitionCheckReason = Annotated[
+    Union[
+        StateMismatchReason,
+        SendQueueOccupiedReason,
+        ReceiveQueueEmptyReason,
+        MessageMismatchReason,
+        SessionCompletedReason,
+    ],
+    Field(discriminator="error"),
+]
+
+
+class TransitionCheckItem(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    transition_id: str
+    enabled: bool
+    # Every unmet requirement is listed; an enabled transition (and a protocol
+    # with no transitions, which yields an empty outer list) carries [].
+    reasons: list[TransitionCheckReason]
+
+
+class TransitionCheckResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    session_id: str
+    version: int
+    # All protocol transitions, sorted by transition id ascending.
+    transitions: list[TransitionCheckItem]
+
+
+# The transition check is a read-only view at one named version, so its body
+# is exactly the same version-only payload as message tracking.
+TransitionCheckRequest = MessageTrackRequest
+
+
 class SessionView(BaseModel):
     id: str
     version: int
